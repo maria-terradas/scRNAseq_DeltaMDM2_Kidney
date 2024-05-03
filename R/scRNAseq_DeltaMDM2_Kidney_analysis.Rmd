@@ -1,0 +1,752 @@
+---
+title: "scRNAseq analysis of kidneys from Delta-MDM2 mice"
+author: "Maria Terradas"
+date: "03/05/2024"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: united
+    code_folding: hide
+    self_contained: true
+editor_options: 
+  chunk_output_type: console
+---
+
+
+
+```{r Load packages, message = FALSE,warning = FALSE,results='hide', include = FALSE}
+suppressPackageStartupMessages({
+  library(SingleCellExperiment)
+  library(scater)
+  library(DropletUtils)
+  library(scran)
+  library(mbkmeans)
+  library(BiocFileCache)
+  library(ggplot2)
+  library(cowplot)
+  library(PCAtools)
+  library(SummarizedExperiment)
+  library(MatrixGenerics)
+  library(matrixStats)
+  library(Seurat)
+  library(dittoSeq)
+  library(ggpubr)
+  library(reshape2)
+  library(tibble)
+  library(clusterProfiler)
+  library("org.Mm.eg.db")
+})
+BiocParallel::register(BiocParallel::SerialParam())
+
+```
+
+
+# Load objects and directories
+Load tables with metadata, as well as directory names and sample names
+```{r Load objects}
+metadata <- readxl::read_xlsx("../Data/metadata.xlsx")
+initial_directory <- "../Data/Runs/Resequencing_cellranger4/"
+end_directory <- "/outs/raw_feature_bc_matrix/"
+RDS_directory <- "./RDS/"
+samples <- c("9-1", "9-2", "9-3", "9-4", "9-5", "9-6")
+
+
+cre_color <- "royalblue2"
+null_color <- "green2"
+tableau20 = c("#1F77B4", "#AEC7E8", "#FF7F0E", "#FFBB78", "#2CA02C", "#98DF8A", "#D62728", "#FF9896", "#9467BD", "#C5B0D5",
+              "#8C564B", "#C49C94", "#E377C2", "#F7B6D2", "#7F7F7F", "#C7C7C7", "#BCBD22", "#DBDB8D", "#17BECF", "#9EDAE5")
+
+tableau10medium = c("#729ECE", "#FF9E4A", "#67BF5C", "#ED665D", "#AD8BC9", "#A8786E", "#ED97CA", "#A2A2A2", "#CDCC5D", "#6DCCDA")
+```
+
+
+# Generate SingleCellExperiment object for each sample
+## Create function to generate sce object
+With this function we will be able to run all the samples with the same parameters in one single loop
+```{r, eval = FALSE}
+make_SCE <- function(sample, info_data, in_dir, end_dir, rds_dir) {
+  barcode_prefix <- sample
+  info <- info_data
+  matrix_directory <- paste(in_dir, barcode_prefix, end_dir, sep = "")
+  RDS_file <- paste(rds_dir, barcode_prefix, "_sce.rds", sep = "")
+  
+  print("Running sample:")
+  print(barcode_prefix)
+  print("Extracting data from:")
+  print(matrix_directory)
+  
+  dir.name <- matrix_directory
+  list.files(dir.name)
+
+  print("Generating sce object:")
+  sce <- read10xCounts(dir.name)
+  
+  #Add metadata to ColData
+  sce$Sample <- NULL
+  sce$Barcode <- paste(barcode_prefix, colData(sce)$Barcode, sep = "_")
+  sce$Sample_name <- rep(info$Sample_name[info$Sample_name == barcode_prefix], times=ncol(sce))
+  sce$Sequencing_run <- rep(as.character(info$Sequencing_run[info$Sample_name == barcode_prefix]), times=ncol(sce))
+  sce$Genotype <- rep(info$Genotype[info$Sample_name == barcode_prefix], times=ncol(sce))
+  sce$Mouse_ID <- rep(info$Mouse_ID[info$Sample_name == barcode_prefix], times=ncol(sce))
+  sce$Tissue <- rep(info$Tissue[info$Sample_name == barcode_prefix], times=ncol(sce))
+  colData(sce)
+  metadata(sce)$Samples <- NULL
+  
+  print(sce)
+  
+  print("Plot Droplets")
+  bcrank <- barcodeRanks(counts(sce), fit.bounds = c(1, 6794880))
+
+  # Only showing unique points for plotting speed.
+  uniq <- !duplicated(bcrank$rank)
+  
+  #Show plot
+  p = plot(bcrank$rank[uniq], bcrank$total[uniq], log="xy",
+  xlab="Rank", ylab="Total UMI count", cex.lab=1.2, main = paste("Droplets plot",barcode_prefix, sep = " "))
+  abline(h=metadata(bcrank)$inflection, col="darkgreen", lty=2)
+  abline(h=metadata(bcrank)$knee, col="dodgerblue", lty=2)
+  legend("bottomleft", legend=c("Inflection", "Knee"), 
+        col=c("darkgreen", "dodgerblue"), lty=2, cex=1.2)
+  print(p)
+    
+
+  print("Find which droplets are real cells")
+  
+  set.seed(124)
+  e.out <- emptyDrops(counts(sce), retain = Inf)
+  table(e.out$FDR <= 0.001)
+  ncol(sce)
+
+  is.cell <- e.out$FDR <= 0.001
+  
+  #Show plot 
+  par(mfrow=c(1,2))
+  
+  p1 = plot(e.out$Total, -e.out$LogProb, col=ifelse(is.cell, "red", "black"),
+    xlab="Total UMI count", ylab="-Log Probability", main = paste("Droplets diagnostic plot", barcode_prefix ,sep = " "))
+  print(p1)
+  
+  p2 = plot(e.out$Total, -e.out$LogProb, col=ifelse(is.cell, "red", "black"),
+    xlab="Total UMI count", ylab="-Log Probability", xlim = c(0, 2000), ylim = c(0, 5000), main = paste("Zoom droplets diagnostic plot", barcode_prefix, sep = " "))
+  print(p2)
+
+  
+  print("Make new sce object with only real cells and save it as RDS object in:")
+  print(RDS_file)
+  sce.no.empty <- sce[,which(is.cell)]
+  sce.no.empty
+
+  saveRDS(sce.no.empty, RDS_file)
+  
+  print("Final sce object is:")
+  print(sce.no.empty)
+  return(sce.no.empty)
+}
+```
+
+
+## Generate sce objects and keep only cells
+Make objects with the raw matrix from cell ranger and use DropletUtils package to only keep droplets with cells
+https://bioconductor.org/books/release/OSCA/droplet-processing.html
+```{r, results = 'markup', eval = FALSE, fig.pos = 'H'}
+for (val in samples) {
+make_SCE(sample = val,  info_data = metadata, in_dir = initial_directory, end_dir = end_directory, rds_dir = RDS_directory)
+}
+
+```
+
+## Load sce objects and merge
+Load each sample's sce object 
+```{r, results = 'markup'}
+sce_9_1 <- readRDS(paste(RDS_directory, "9-1", "_sce.rds", sep = ""))
+sce_9_2 <- readRDS(paste(RDS_directory, "9-2", "_sce.rds", sep = ""))
+sce_9_3 <- readRDS(paste(RDS_directory, "9-3", "_sce.rds", sep = ""))
+sce_9_4 <- readRDS(paste(RDS_directory, "9-4", "_sce.rds", sep = ""))
+sce_9_5 <- readRDS(paste(RDS_directory, "9-5", "_sce.rds", sep = ""))
+sce_9_6 <- readRDS(paste(RDS_directory, "9-6", "_sce.rds", sep = ""))
+```
+
+Merge all samples in one sce object
+```{r, results = 'markup'}
+sce <- cbind(sce_9_1, sce_9_2, sce_9_3, sce_9_4, sce_9_5, sce_9_6)
+sce
+
+#saveRDS(sce, paste(RDS_directory, "sce_all.rds", sep = ""))
+```
+
+
+# Quality Control analysis
+```{r}
+sce <- readRDS(paste(RDS_directory, "sce_all.rds", sep = ""))
+rownames(sce) <- rowData(sce)$Symbol
+mito_genes <- grep("^mt-",rowData(sce)$Symbol)
+ribo_genes <- grep("^Rp",rowData(sce)$Symbol)
+head(mito_genes,10)
+head(ribo_genes,10)
+
+df <- perCellQCMetrics(sce, subsets=list(Mito = mito_genes, Ribo = ribo_genes))
+df
+colData(sce) <- cbind(colData(sce), df)
+
+df2 <- perFeatureQCMetrics(sce)
+df2
+rowData(sce) <- cbind(rowData(sce), df2)
+```
+
+## QC-based filtering for cells
+Bad quality cells will be filtered out of the analysis. Only cells with more than 75 genes or less than 3000 genes expressed and with less than 50% mitochondrial gene expression content will be included.
+```{r,message = FALSE,warning = FALSE, results='hold',fig.height=5,fig.width=4}
+qc.nexprs <- (df$detected < 75 | df$detected > 3000)
+qc.mito <- df$subsets_Mito_percent > 50
+
+discard <-  qc.nexprs | qc.mito 
+table(discard)
+sce$discard <- discard
+
+
+outliers_table <- cbind(table(qc.nexprs), table(qc.mito), table(discard)) 
+
+colnames(outliers_table) <- c("qc.nexprs", "qc.mito", "total_outliers") 
+
+outliers_table
+```
+
+## Plot QC
+Plot each sample separate
+```{r,message = FALSE,warning = FALSE, results='hold', fig.pos = 'H'}
+par(mfrow = c(2,2))
+plotColData(sce, x = "Sample_name", y="sum", colour_by = "discard") + scale_y_log10() + ggtitle("Total count")
+plotColData(sce, x = "Sample_name", y="detected", colour_by = "discard") + scale_y_log10() + ggtitle("Detected features")
+
+plotColData(sce, x = "Sample_name", y="subsets_Mito_percent", colour_by = "discard") + ggtitle("Mito Percent") + ylim(0,100)
+plotColData(sce, x = "Sample_name", y="subsets_Ribo_percent", colour_by = "discard") + ggtitle("Ribo Percent") + ylim(0,100)
+
+```
+
+Plot each Sequencing run separate
+```{r,message = FALSE,warning = FALSE, results='hold',results='hold',fig.height=5,fig.width=16}
+par(mfrow = c(2,2))
+plotColData(sce, x = "Sequencing_run", y="sum", colour_by = "discard") + scale_y_log10() + ggtitle("Total count")
+plotColData(sce, x = "Sequencing_run", y="detected", colour_by = "discard") + scale_y_log10() + ggtitle("Detected features")
+
+plotColData(sce, x = "Sequencing_run", y="subsets_Mito_percent", colour_by = "discard") + ggtitle("Mito Percent") + ylim(0,100)
+plotColData(sce, x = "Sequencing_run", y="subsets_Ribo_percent", colour_by = "discard") + ggtitle("Ribo Percent") + ylim(0,100)
+
+```
+
+
+Plot each Genotype separate
+```{r,message = FALSE,warning = FALSE, results='hold',results='hold',fig.height=5,fig.width=16}
+par(mfrow = c(2,2))
+plotColData(sce, x = "Genotype", y="sum", colour_by = "discard") + scale_y_log10() + ggtitle("Total count")
+plotColData(sce, x = "Genotype", y="detected", colour_by = "discard") + scale_y_log10() + ggtitle("Detected features")
+
+plotColData(sce, x = "Genotype", y="subsets_Mito_percent", colour_by = "discard") + ggtitle("Mito Percent") + ylim(0,100)
+plotColData(sce, x = "Genotype", y="subsets_Ribo_percent", colour_by = "discard") + ggtitle("Ribo Percent") + ylim(0,100)
+
+```
+
+```{r,message = FALSE,warning = FALSE, results='hold',results='hold',fig.height=5,fig.width=16}
+par(mfrow=c(2,2))
+plotColData(sce, x = "sum", y = "subsets_Mito_percent", colour_by = "discard") + scale_x_log10() 
+plotColData(sce, x = "sum", y = "subsets_Ribo_percent", colour_by = "discard") + scale_x_log10()
+plotColData(sce, x = "subsets_Mito_percent", y = "subsets_Ribo_percent", colour_by = "discard") + scale_x_log10()
+
+
+plotColData(sce, x = "sum", y = "subsets_Mito_percent", colour_by = "Sequencing_run") + scale_x_log10()
+plotColData(sce, x = "sum", y = "subsets_Ribo_percent", colour_by = "Sequencing_run") + scale_x_log10()
+plotColData(sce, x = "subsets_Mito_percent", y = "subsets_Ribo_percent", colour_by = "Sequencing_run") + scale_x_log10()
+dev.off()
+```
+
+## Filter genes
+For now, filter out all genes that have 0 expression 
+```{r}
+table(rowSums(counts(sce)) > 1)
+```
+
+We will only keep genes with at least 1 UMI in 10 cells
+```{r}
+num_umis <- 1
+is_expressed <- rowSums(counts(sce) >= num_umis ) >= 10
+sce <- sce[is_expressed,]
+sce
+```
+
+Delete the cells that were considered outliers with the set parameters
+```{r}
+sce_filt <- sce[,!discard]
+sce_filt
+```
+
+# Normalization
+Normalization will be performed using the normalization by deconvolution method by Lun et al.2016 and implemented in the scran package.
+```{r}
+lib.sf <- librarySizeFactors(sce_filt)
+summary(lib.sf)
+
+clust <- quickCluster(sce_filt) 
+table(clust)
+deconv.sf <- calculateSumFactors(sce_filt, cluster=clust)
+summary(deconv.sf)
+
+plot(lib.sf, deconv.sf, xlab="Library size factor",
+    ylab="Deconvolution size factor", log='xy', pch=16)
+abline(a=0, b=1, col="red")
+
+sce_filt <- logNormCounts(sce_filt, size_factors = deconv.sf)
+colData(sce_filt)$avg_logcounts <- colMeans(logcounts(sce_filt))
+plotColData(sce_filt, x = "Sample_name", y = "avg_logcounts", colour_by = "Sequencing_run") 
+
+```
+
+
+Save normalized object in rds format
+```{r}
+saveRDS(sce_filt, paste(RDS_directory, "sce_all_filt_norm.rds", sep = ""))
+```
+
+
+# Dimensionality Reduction
+## Find Highly variable genes
+```{r}
+var.gene <- modelGeneVar(sce_filt, assay.type = "logcounts")
+
+#plot mean over BIOLOGICAL variance
+plot(var.gene$mean, var.gene$bio, pch=16, cex=0.4, xlab="Mean log-expression",
+     ylab="Variance of log-expression")
+lines(c(min(var.gene$mean),max(var.gene$mean)), c(0,0), col="dodgerblue", lwd=2)
+
+#Select the top 10% genes with the highest biological components
+hvg.out <- getTopHVGs(var.gene, prop=0.1)
+```
+
+
+## PCA
+```{r}
+set.seed(133)
+
+sce_filt <- runPCA(sce_filt, exprs_values = "logcounts", ncomponents = 100, subset_row = rownames(hvg.out)) 
+```
+
+
+Plots
+```{r, fig.asp=.28}
+plot_grid(ncol = 3,
+  plotReducedDim(sce_filt, dimred = "PCA",colour_by = "Sample_name",ncomponents = 1:2),
+  plotReducedDim(sce_filt, dimred = "PCA",colour_by = "Sequencing_run",ncomponents = 1:2),
+  plotReducedDim(sce_filt, dimred = "PCA",colour_by = "Genotype",ncomponents = 1:2) + scale_fill_manual(values = c(cre_color, null_color)))
+
+```
+
+
+Now plot the amount of variance explained by each PC (add as many PCs as computed)
+```{r,fig.asp=.4}
+percent.var <- attr(reducedDim(sce_filt), "percentVar")
+chosen.elbow <- PCAtools::findElbowPoint(percent.var)
+chosen.elbow
+
+plot(percent.var, xlab="PC", ylab="Variance explained (%)")
+abline(v=chosen.elbow, col="red")
+```
+
+
+## UMAP
+```{r}
+sce_filt <- runUMAP(sce_filt,  dimred = "PCA", n_dimred = 20,   ncomponents = 2)
+
+```
+
+```{r}
+plotUMAP(sce_filt, colour_by = "Sample_name")
+plotUMAP(sce_filt, colour_by = "Sequencing_run")
+plotUMAP(sce_filt, colour_by = "Genotype") + scale_color_manual(values = c(cre_color, null_color))
+          
+```
+
+Save object with dimensionality reduction
+
+```{r}
+saveRDS(sce_filt, paste(RDS_directory, "sce_all_filt_dimred.rds", sep = ""))
+```
+
+# Identify senescent cells using reference dataset
+
+In this step, we want to identify senescent cells. We do this step before clustering, as it needs to be performed in a SingleCellExperiment object. This cell type assignment doe snot rely on a dimensionality reduction. It uses the gene expression matrix information and compares it to the gene expression of the cells in the reference dataset.
+
+NOTE: This step can take several hours to run
+```{r}
+eos_sc <- readRDS("~/Documents/CK_sc_kidney/Data/scRNAseq/Eoin_analysis/Global_sen_2020_labels")
+
+
+eos_sc_SCE<-as.SingleCellExperiment(eos_sc)
+pred.sen <- SingleR(test=sce_filt, ref=eos_sc_SCE, labels=eos_sc_SCE$JuneIdent2020,tune.thresh = 0.4,de.n=150,quantile = 0.6,fine.tune = T)
+
+pred.sen = pred.sen[colnames(sce_filt),]
+sce_filt$eoin.labels = pred.sen$labels
+```
+
+
+Save object with reference cell type assignment
+```{r}
+saveRDS(sce_filt, paste(RDS_directory, "sce_filt_w_eoin_labels.rds", sep = ""))
+```
+
+
+# Clustering and Cell Type assignment
+Now we will perform manual cell type annotation. For that we will identify clusters using the UMAP generated before. We will use Seurat's functions to do that, so the SCE object will be converted into a seurat object.
+```{r}
+so = as.Seurat(sce_filt, counts = "counts", data = "logcounts")
+so@reductions$umap = so@reductions$UMAP
+so@reductions$pca = so@reductions$PCA
+
+set.seed(234)
+so = FindVariableFeatures(so, selection.method = "vst", nfeatures = 2000)
+so <- ScaleData(so, features = rownames(so))
+so <- FindNeighbors(so, dims = 1:20)
+so <- FindClusters(so, resolution = 0.5)
+
+DimPlot(so, group.by = "seurat_clusters", cols = tableau10medium)
+```
+
+## Assign clusters to cell types
+
+Check top markers for each cluster
+```{r}
+Idents(so) = so$seurat_clusters
+markers = FindAllMarkers(so, only.pos = TRUE)
+markers
+```
+
+
+Check expression of key genes
+```{r}
+markers_list = c("Cryab","Igfbp7","Ly6c1","Tm4sf1","Plat","Kdr","Slc27a2","Slc5a2","Lrp2","Umod","Slc12a1","Egf","Atp1a1","Slc12a3","Calb1","Slc8a1","Atp6v1g3","Aqp2","C1qb","C1qa","H2-Eb1","Cd74","Lgals3","Lyz2","S100a9","S100a8","Ccl5")
+#filt_markers_list = c( "Lrp2","Slc27a2", "Slc34a1", "Slc4a4", "Kap", "Gatm", "Miox", "Umod","Slc12a1", "Slc12a3", "Calb1","Slc8a1", "Atp6v1g3","Aqp2","Cd74")
+
+
+VlnPlot(so, features = markers_list, group.by = "seurat_clusters", stack = TRUE, split.by = "Genotype") + scale_fill_manual(values = c(null_color, cre_color))
+
+```
+
+After checking expression of key genes and top markers, the annotation of clusters to cell types was performed manually
+```{r}
+so$CellType2024 = ""
+so$CellType2024[so$seurat_clusters == "0"] = "PTC 1"
+so$CellType2024[so$seurat_clusters == "1"] = "PTC 2"
+so$CellType2024[so$seurat_clusters == "2"] = "Mixed"
+so$CellType2024[so$seurat_clusters == "3"] = "DTC 1"
+so$CellType2024[so$seurat_clusters == "4"] = "Loop of Henle"
+so$CellType2024[so$seurat_clusters == "5"] = "PTC 3"
+so$CellType2024[so$seurat_clusters == "6"] = "Collecting Ducts"
+so$CellType2024[so$seurat_clusters == "7"] = "DTC 2"
+```
+
+
+Cluster assignments table
+```{r}
+df = as.data.frame(table(so$CellType2024, so$seurat_clusters))
+df = df[df$Freq > 0,]
+
+
+df_clusts = aggregate(df$Var2, by=list(df$Var1), paste, collapse=", ")
+colnames(df_clusts) = c("Cell Type", "cluster number")
+
+df_numbs = aggregate(df$Freq, list(df$Var1), FUN=sum) 
+colnames(df_numbs) = c("Cell Type", "cells")
+
+df_final = merge(df_clusts, df_numbs, by = "Cell Type")
+
+tibble(df_final)
+```
+
+
+## Subclustering of Mixed cells
+Perform dimensionality reduction and clustering only with the mixed cell cluster
+```{r}
+
+so_mixed = so[,so$CellType2024 == "Mixed"]
+
+set.seed(244)
+so_mixed = FindVariableFeatures(so_mixed, selection.method = "vst", nfeatures = 1000)
+so_mixed <- ScaleData(so_mixed, features = rownames(so))
+so_mixed <- RunPCA(so_mixed, features = VariableFeatures(object = so_mixed))
+
+so_mixed <- FindNeighbors(so_mixed, dims = 1:10)
+so_mixed <- FindClusters(so_mixed, resolution = 0.2)
+so_mixed <- RunUMAP(so_mixed, dims = 1:10)
+
+
+DimPlot(so_mixed, cols = tableau20, reduction = "umap") + ggtitle("")
+```
+
+
+Check expression of genes of interest in each cluster
+```{r}
+markers_list_mixed = c("Cryab","Igfbp7", "S100a9","S100a8","Ccl5","H2-Eb1","Cd74", "Ly6c1","Tm4sf1","Lyz2")
+
+VlnPlot(so_mixed, features = markers_list_mixed, stack = TRUE, split.by = "Genotype") + scale_fill_manual(values = c(null_color, cre_color))
+```
+
+Assign each new subcluster to a cell type
+```{r}
+so_mixed$CellType2024_sub = ""
+so_mixed$CellType2024_sub[so_mixed$seurat_clusters == "0"] = "Macrophages"
+so_mixed$CellType2024_sub[so_mixed$seurat_clusters == "1"] = "Interstitial cells"
+so_mixed$CellType2024_sub[so_mixed$seurat_clusters == "2"] = "APC"
+so_mixed$CellType2024_sub[so_mixed$seurat_clusters == "3"] = "Podocytes"
+so_mixed$CellType2024_sub[so_mixed$seurat_clusters == "4"] = "Neutrophils"
+so_mixed$CellType2024_sub[so_mixed$seurat_clusters == "5"] = "Podocytes"
+so_mixed$CellType2024_sub[so_mixed$seurat_clusters == "6"] = "Mesenchymal (other)"
+
+so_mixed$CellType2024_sub = factor(so_mixed$CellType2024_sub, levels = c("Podocytes", "Neutrophils", "Mesenchymal (other)", "Macrophages", "APC", "Interstitial cells"))
+
+
+DimPlot(so_mixed, cols = tableau20, group.by = "CellType2024_sub", reduction = "umap") + ggtitle("")
+VlnPlot(so_mixed, features = markers_list_mixed, stack = TRUE, split.by = "Genotype", group.by = "CellType2024_sub") + scale_fill_manual(values = c(null_color, cre_color))
+```
+
+
+
+# Signatures {.tabset}
+
+Gene lists associated with specific pathways were manually created and using the AddModuleScore function from seurat, a score for each cell was generated for each signature.
+
+```{r}
+p21_signature = c("Aurka","Aurkb","Anln","Arhgap11a","Aspm","Birc5","Cdc20","Cdk2","Cdkn1a","Cdkn3","Cenpf","Cenpm","Dlgap5","Gas2l3","Hmmr","Kif11")
+Tgfb_signature = c("Acvr1","Ccn2","Gpc1","Jun","Mapk13","Pdgfa","Smad7","Sox9","Tgfbr1")
+Jakstat_signature = c("Il6st","Il6ra","Socs3","Stat3","Tgfb1","Birc5","Lifr","Vim","Lcn2")
+
+so <- AddModuleScore(so, features = list(p21_signature, Tgfb_signature, Jakstat_signature), name=list("p21_sig2024", "Tgfb_sig2024", "Jakstat_sig2024"), ctrl = 10, nbin = 25)
+
+so$p21_sig2024 = so$p21_sig20241
+so$p21_sig20241 = NULL
+so$Tgfb_sig2024 = so$Tgfb_sig20242
+so$Tgfb_sig20242 = NULL
+so$Jakstat_sig2024 = so$Jakstat_sig20243
+so$Jakstat_sig20243 = NULL
+```
+
+## Signature plots {.tabset}
+### p21 signature
+```{r}
+patchwork::wrap_plots( FeaturePlot(so, features="p21_sig2024", split.by = "Genotype", combine=FALSE, pt.size = 1, order = TRUE)) & theme_minimal() & scale_color_gradient2(low = "blue", mid = "gray95", high = "darkred", limits = range(so$p21_sig2024))
+```
+
+### Tgfb signature
+```{r}
+patchwork::wrap_plots( FeaturePlot(so, features="Tgfb_sig2024", split.by = "Genotype", combine=FALSE, pt.size = 1, order = TRUE)) & theme_minimal() & scale_color_gradient2(low = "blue", mid = "gray95", high = "darkred", limits = range(so$p21_sig2024))
+
+```
+
+### Jakstat signature
+```{r}
+patchwork::wrap_plots( FeaturePlot(so, features="Jakstat_sig2024", split.by = "Genotype", combine=FALSE, pt.size = 1, order = TRUE)) & theme_minimal() & scale_color_gradient2(low = "blue", mid = "gray95", high = "darkred", limits = range(so$p21_sig2024))
+
+```
+
+## Pie charts
+```{r, fig.height = 10, fig.width = 7}
+create_sigtable = function(cell_type, sig_col) {
+  df = data.frame(total = c(dim(so[,grepl(cell_type, so$CellType2024) & so$Genotype == "Cre"])[2],
+                     dim(so[,grepl(cell_type, so$CellType2024) & so$Genotype == "Null"])[2]),
+                  sig_pos = c(dim(so[,grepl(cell_type, so$CellType2024) & so$Genotype == "Cre" & so@meta.data[,sig_col] > 0])[2],
+                          dim(so[,grepl(cell_type, so$CellType2024) & so$Genotype == "Null" & so@meta.data[,sig_col] > 0])[2]),
+                  sig_neg = c(dim(so[,grepl(cell_type, so$CellType2024) & so$Genotype == "Cre" & so@meta.data[,sig_col] <= 0])[2],
+                               dim(so[,grepl(cell_type, so$CellType2024) & so$Genotype == "Null" & so@meta.data[,sig_col] <= 0])[2]),
+                  row.names = c("Cre", "Null"))
+  df$sig_pos_perc = df$sig_pos / df$total * 100
+  df$sig_neg_perc = df$sig_neg / df$total * 100
+  
+  return(df)
+}
+
+pie_cols = c("#8D8DFF", "#94641E")
+names(pie_cols) = c("Score≤0","Score>0")
+
+make_pie_charts = function(df_all, name) {
+  chi_test = chisq.test(df_all[,c("sig_pos", "sig_neg")])
+  pval = chi_test$p.value
+  
+  if (pval < 0.0001) {
+    pval = "p<0.0001"
+  } else {
+    pval = paste0("p=", round(pval,4))
+  }
+  
+  df = df_all[, c("sig_pos_perc", "sig_neg_perc")]
+  df$genotype = rownames(df)
+
+  df_melt = melt(df)
+  df_melt$legend = ""
+  df_melt$legend[df_melt$variable == "sig_pos_perc"] = "Score>0"
+  df_melt$legend[df_melt$variable == "sig_neg_perc"] = "Score≤0"
+  df_melt$label = paste0(round(df_melt$value, 2), "%")
+
+  pies_list = list()
+  pies_list[["name"]] = text_grob(name)
+  for (gen in c("Null", "Cre")) {
+    pies_list[[gen]] = ggplot(df_melt[df_melt$genotype == gen,], aes(x="", y=value, fill=legend)) +
+                      geom_bar(stat="identity", width=1) +
+                      coord_polar("y", start=0) +
+                      theme_void() + theme(legend.position="none") + geom_text(aes(x = c(1.8, 0.8), y = c(4, 50), label = label), color = "black", size=6) +
+                      scale_fill_manual(values = pie_cols)
+  }
+  
+  pies_list[["pvalue"]] = text_grob(pval)
+
+  p = ggarrange(plotlist = pies_list, ncol = 4, widths = c(0.5, 1.25, 1.25, 0.5))
+  return(p)
+
+}
+
+p21sig_tab = create_sigtable("PTC", "p21_sig2024")
+Tgfbsig_tab = create_sigtable("PTC", "Tgfb_sig2024")
+JakStatsig_tab = create_sigtable("PTC", "Jakstat_sig2024")
+JakStatMIXsig_tab = create_sigtable("Mixed", "Jakstat_sig2024")
+
+plot_list = list()
+for (tab_name in c("p21sig_tab", "Tgfbsig_tab", "JakStatsig_tab", "JakStatMIXsig_tab")) {
+  plot_list[[tab_name]] = make_pie_charts(get(tab_name), tab_name)
+}
+
+ggarrange(plotlist = plot_list, ncol = 1)
+
+```
+
+
+## Senescenct cells vs p21 positive cells 
+
+```{r, fig.height = 5, fig.width = 8}
+
+so$sen_p21.status = "none"
+so$sen_p21.status[so$p21_sig2024 > 0 & so$eoin.labels == "Senescent_epithelial"] = "Senescent & p21sig > 0"
+so$sen_p21.status[so$p21_sig2024 > 0 & so$eoin.labels != "Senescent_epithelial"] = "p21sig > 0"
+so$sen_p21.status[so$p21_sig2024 <= 0 & so$eoin.labels == "Senescent_epithelial"] = "Senescent"
+
+
+
+sen_cells = colnames(so)[so$eoin.labels == "Senescent_epithelial"]
+DimPlot(so, pt.size = 2,label = F,repel=T, cells.highlight = sen_cells, cols.highlight = "red", sizes.highlight = 2, split.by = "Genotype") + ggtitle("") + scale_colour_manual(labels = c("nonsen", "sen"), values = c("grey", "red"))
+
+
+
+cells_to_col = list("Senescent & p21sig > 0" = colnames(so)[so$sen_p21.status == "Senescent & p21sig > 0"],
+                    "p21sig > 0" = colnames(so)[so$sen_p21.status == "p21sig > 0"],
+                    "Senescent" = colnames(so)[so$sen_p21.status == "Senescent"])
+
+
+colors = c("yellow", "orange", "red")
+
+DimPlot(so, pt.size = 2,label = F,repel=T, cells.highlight = cells_to_col, cols.highlight = colors, sizes.highlight = c(2, 1, 2), split.by = "Genotype") + ggtitle("")
+
+
+```
+
+
+# Heatmaps
+## Heatmap PTC - DTC- LOH and slc genes
+```{r, fig.height = 10, fig.width = 8}
+
+so_TUB_LOH = so[,so$CellType2024 %in% c("PTC 1", "PTC 2", "PTC 3", "DTC 1", "DTC 2", "Loop of Henle")]
+
+so_TUB_LOH$type_and_genotype = paste(so_TUB_LOH$CellType2024, so_TUB_LOH$Genotype, sep = " ")
+so_TUB_LOH$type_and_genotype = gsub(" [0-9]", "",so_TUB_LOH$type_and_genotype)
+
+so_TUB_LOH$type_and_genotype = factor(so_TUB_LOH$type_and_genotype, levels = c("PTC Null", "PTC Cre", "DTC Null", "DTC Cre", "Loop of Henle Null", "Loop of Henle Cre"))
+Idents(so_TUB_LOH) = so_TUB_LOH$type_and_genotype
+
+
+
+so_TUB_LOH <- ScaleData(so_TUB_LOH, features = sig_slc_genes_ordered)
+cluster.averages <- AverageExpression(so_TUB_LOH, return.seurat=TRUE, group.by = "type_and_genotype") 
+Idents(cluster.averages) = colnames(cluster.averages)
+
+DoHeatmap(cluster.averages,  features = sig_slc_genes_ordered, size = 3, draw.lines = FALSE, group.bar.height = 0) + guides(color="none")
+```
+
+
+## Heatmap Slc genes PTC p21pos (Cre vs Null) vs nonpos
+```{r, fig.height = 8, fig.width = 6}
+
+so_PTC = so[,grepl("PTC", so$CellType2024)]
+
+so_PTC$p21_sig_gen = ""
+so_PTC$p21_sig_gen[so_PTC$Genotype == "Cre" & so_PTC$p21_sig2024 > 0] = "Cre_p21sig > 0"
+so_PTC$p21_sig_gen[so_PTC$Genotype == "Null" & so_PTC$p21_sig2024 > 0] = "Null_p21sig > 0"
+so_PTC$p21_sig_gen[so_PTC$p21_sig2024 <= 0] = "ALL_p21sig <= 0"
+
+so_PTC$p21_sig_gen = factor(so_PTC$p21_sig_gen, levels = c("ALL_p21sig <= 0", "Null_p21sig > 0", "Cre_p21sig > 0"))
+
+Idents(so_PTC) = so_PTC$p21_sig_gen
+sce_PTC = as.SingleCellExperiment(so_PTC)
+
+plotGroupedHeatmap(sce_PTC, features = sig_slc_genes_ordered, group = "p21_sig_gen", block = "p21_sig_gen", center = TRUE, symmetric = TRUE,  cluster_cols = FALSE, cluster_rows = TRUE, fontsize_row = 10, fontsize_col = 15, treeheight_row = 0)
+
+
+```
+
+
+# Pathway analysis
+GO pathways PTC Cre vs Null
+```{r}
+so_PTC_dge = so[,grepl("PTC", so$CellType2024)]
+
+Idents(so_PTC_dge) = so_PTC_dge$Genotype
+ident1 = "Cre"
+ident2 = "Null"
+
+dge_PTC = FindMarkers(so_PTC_dge, ident.1 = ident1, ident.2 = ident2, 
+                          features = rownames(so_PTC_dge),
+                          min.diff.pct = -Inf, 
+                          min.pct = 0,
+                          logfc.threshold = 0)
+de_table = dge_PTC
+
+x = de_table[,grepl("log2FC|adj", colnames(de_table))]
+x$gene_symbol = rownames(x)
+colnames(x) = c("log2fc", "p_adj", "gene_symbol")
+x$log2fc = as.numeric(x$log2fc)
+x$p_adj = as.numeric(x$p_adj)
+x$metric = x$log2fc * -log10(x$p_adj)
+x = na.omit(x)
+x = x[is.finite(x$metric),]
+x = x[order(x$metric, decreasing = TRUE),]
+  
+GSEA_genes_list = x$metric
+names(GSEA_genes_list) = x$gene_symbol
+  
+  
+gse_CREvsNULL_PTC = gseGO(geneList=GSEA_genes_list,ont ="BP", keyType = "SYMBOL", minGSSize= 5, maxGSSize = 800, pvalueCutoff = 0.1, OrgDb = org.Mm.eg.db, pAdjustMethod = "none")
+  
+
+gene_list_entrez = bitr(names(GSEA_genes_list), fromType = "SYMBOL", toType = c("ENTREZID"), OrgDb = org.Mm.eg.db)
+GSEA_genes_list_entrez = GSEA_genes_list
+names(GSEA_genes_list_entrez) = gene_list_entrez$ENTREZID[match(names(GSEA_genes_list_entrez), gene_list_entrez$SYMBOL)]
+gsekegg_CREvsNULL_PTC = gseKEGG(geneList=GSEA_genes_list_entrez, organism ="mmu", minGSSize= 3, maxGSSize = 800, pvalueCutoff = 0.05, pAdjustMethod = "none", keyType = "ncbi-geneid")
+  
+  
+interesting_terms = c("GO:0071635","GO:0060055","GO:0007599","GO:0050817","GO:0070072","GO:0030010","GO:0009611","GO:0042938","mmu04215")
+gse_terms_interest = gse_CREvsNULL_PTC
+gse_terms_interest@result = rbind(gse_terms_interest@result, gsekegg_CREvsNULL_PTC@result)
+gse_terms_interest@result = gse_terms_interest@result[gse_terms_interest@result$ID %in% interesting_terms,]
+
+gse_terms_interest@result$group = "supressed"
+gse_terms_interest@result$group[gse_terms_interest@result$NES > 0] = "activated"
+gse_terms_interest@result$group= factor(gse_terms_interest@result$group, levels = c("supressed", "activated"))
+  
+dotplot(gse_terms_interest, showCategory=10, split=".sign") + facet_grid(.~group)
+
+```
+
+# Save final RDS object
+```{r}
+saveRDS(so, paste(RDS_directory, "seurat_final2024.rds", sep = ""))
+```
+
+# Session Information
+```{r}
+sessionInfo()
+```
